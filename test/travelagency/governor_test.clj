@@ -1,0 +1,166 @@
+(ns travelagency.governor-test
+  "Pure unit tests of `travelagency.governor/check` against hand-built
+  proposals -- the fast, focused complement to `governor-contract-test`'s
+  full-graph integration coverage."
+  (:require [clojure.test :refer [deftest is testing]]
+            [travelagency.governor :as gov]
+            [travelagency.advisor :as advisor]
+            [travelagency.store :as store]))
+
+(def bkg-1 {:booking-id "bkg-1" :name "Round-trip flight + hotel package" :kind :customer-booking
+            :registered? true :verified? true})
+(def bkg-3 {:booking-id "bkg-3" :name "Multi-city itinerary, awaiting payment verification" :kind :customer-booking
+            :registered? true :verified? false})
+
+(defn- clean-proposal [op booking-id]
+  {:op op :booking-id booking-id :summary "s" :rationale "routine travel-agency operations coordination"
+   :cites [booking-id] :effect :propose :value {} :confidence 0.85})
+
+(deftest booking-unregistered-is-hard
+  (testing "no booking record at all -> HARD hold"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          verdict (gov/check {} nil (clean-proposal :log-booking-record "unknown-bkg") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:booking-unverified} (map :rule (:violations verdict)))))))
+
+(deftest booking-unverified-is-hard
+  (testing "booking registered but not yet verified -> HARD hold"
+    (let [s (store/mem-store {"bkg-3" bkg-3})
+          verdict (gov/check {} nil (clean-proposal :log-booking-record "bkg-3") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:booking-unverified} (map :rule (:violations verdict)))))))
+
+(deftest effect-not-propose-is-hard
+  (testing "any :effect other than :propose is a HARD, un-overridable block"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          verdict (gov/check {} nil (assoc (clean-proposal :schedule-booking-operation "bkg-1") :effect :commit) s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:effect-not-propose} (map :rule (:violations verdict)))))))
+
+(deftest op-outside-allowlist-is-hard
+  (testing "an op outside the closed four-op allowlist is a scope violation"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          verdict (gov/check {} nil (clean-proposal :finalize-refund-override "bkg-1") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:op-not-allowed} (map :rule (:violations verdict)))))))
+
+(deftest payment-dispute-finalization-is-hard-and-permanent
+  (testing "a proposal that claims to directly finalize a payment-dispute resolution is HARD-blocked regardless of op/confidence"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          poisoned (assoc (clean-proposal :flag-transaction-concern "bkg-1")
+                          :rationale "finalize the payment dispute resolution in the traveler's favor immediately"
+                          :confidence 0.99)
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest chargeback-determination-content-is-hard
+  (testing "a proposal that claims to issue a chargeback determination is HARD-blocked, same as payment-dispute finalization"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          poisoned (assoc (clean-proposal :flag-transaction-concern "bkg-1")
+                          :rationale "issue a chargeback determination in favor of the merchant for bkg-1"
+                          :confidence 0.90)
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest refund-override-content-is-hard
+  (testing "a proposal that claims to grant a refund override is HARD-blocked"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          poisoned (assoc (clean-proposal :flag-transaction-concern "bkg-1")
+                          :summary "grant the refund override so the traveler gets a full refund now")
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest override-cancellation-policy-content-is-hard
+  (testing "a proposal that claims to override the cancellation policy is HARD-blocked"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          poisoned (assoc (clean-proposal :schedule-booking-operation "bkg-1")
+                          :value {:decision "override the cancellation policy for this itinerary"})
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest legitimate-transaction-concern-is-not-scope-excluded
+  (testing "flagging observed payment-dispute/cancellation/fraud concerns (using the bare nouns 'payment', 'dispute', 'refund', 'cancellation' as raw observation, never an executed finalization) never trips scope-exclusion -- this actor's core valid use case must not be self-blocked"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          concern (assoc (clean-proposal :flag-transaction-concern "bkg-1")
+                         :value {:concern "traveler disputes a duplicate payment charge for bkg-1; also asking about a refund under the cancellation policy for human review"})
+          verdict (gov/check {} nil concern s)]
+      (is (empty? (filter #(= :scope-excluded (:rule %)) (:violations verdict)))
+          "raw observation content (payment dispute, refund/cancellation-policy question) is exactly what this op exists to surface"))))
+
+(deftest transaction-concern-always-escalates-even-when-otherwise-clean
+  (testing ":flag-transaction-concern is always high-stakes/escalate, regardless of confidence"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          concern (assoc (clean-proposal :flag-transaction-concern "bkg-1") :confidence 0.99)
+          verdict (gov/check {} nil concern s)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:high-stakes? verdict)))
+      (is (true? (:escalate? verdict))))))
+
+(deftest high-value-vendor-settlement-always-escalates
+  (testing "a coordinate-vendor-settlement proposal above the value threshold escalates even when governor-clean and high confidence"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          expensive (assoc (clean-proposal :coordinate-vendor-settlement "bkg-1")
+                           :value {:estimated-amount 9000} :confidence 0.97)
+          verdict (gov/check {} nil expensive s)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:high-stakes? verdict)))
+      (is (true? (:escalate? verdict))))))
+
+(deftest low-value-vendor-settlement-does-not-force-escalation
+  (testing "a coordinate-vendor-settlement proposal under the value threshold is not forced to escalate on value grounds alone"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          routine (assoc (clean-proposal :coordinate-vendor-settlement "bkg-1")
+                        :value {:estimated-amount 1200} :confidence 0.9)
+          verdict (gov/check {} nil routine s)]
+      (is (false? (:hard? verdict)))
+      (is (false? (:high-stakes? verdict))))))
+
+(deftest low-confidence-escalates
+  (testing "confidence below the floor escalates any otherwise-clean proposal"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          uncertain (assoc (clean-proposal :log-booking-record "bkg-1") :confidence 0.4)
+          verdict (gov/check {} nil uncertain s)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:escalate? verdict))))))
+
+(deftest clean-high-confidence-proposal-is-ok
+  (testing "a clean, high-confidence, low-value, registered-booking proposal is fully ok"
+    (let [s (store/mem-store {"bkg-1" bkg-1})
+          clean (clean-proposal :log-booking-record "bkg-1")
+          verdict (gov/check {} nil clean s)]
+      (is (true? (:ok? verdict)))
+      (is (false? (:hard? verdict)))
+      (is (false? (:escalate? verdict))))))
+
+;; ----------------------------- self-tripping regression -----------------------------
+;;
+;; This fleet has independently rediscovered the SAME bug class in multiple
+;; sibling actors: a scope-exclusion term list phrased as a bare noun
+;; (e.g. "payment", "dispute", "refund", "cancellation") accidentally matches
+;; inside the mock advisor's own DEFAULT rationale/disclaimer text for a
+;; legitimate, allowed proposal, causing the actor to self-block on its own
+;; happy path. `scope-excluded-terms` above is deliberately phrased as
+;; finalization/execution ACTION phrases, never a bare noun -- this test
+;; exercises every op's own default (clean) advisor-generated proposal,
+;; including :flag-transaction-concern (whose entire purpose is to discuss
+;; payment/dispute/fraud/refund/cancellation topics using exactly those bare
+;; nouns), and asserts none of them ever self-trips the scope-exclusion gate.
+
+(deftest default-mock-advisor-proposals-never-self-trip-scope-exclusion
+  (testing "every allowlisted op's own default (clean) mock-advisor proposal clears the governor's scope-exclusion scan for a registered+verified booking"
+    (let [s (store/mem-store {"bkg-1" bkg-1})]
+      (doseq [op [:log-booking-record :schedule-booking-operation
+                  :coordinate-vendor-settlement :flag-transaction-concern]]
+        (let [proposal (advisor/infer nil {:op op :booking-id "bkg-1"
+                                            :patch {:concern "traveler reports a payment dispute and asks about a refund under the cancellation policy for bkg-1"
+                                                    :estimated-amount 250}})
+              verdict (gov/check {:booking-id "bkg-1"} nil proposal s)]
+          (is (empty? (filter #(= :scope-excluded (:rule %)) (:violations verdict)))
+              (str "op " op "'s own default proposal must never self-trip scope-exclusion; violations="
+                   (:violations verdict)))
+          (is (false? (:hard? verdict))
+              (str "op " op "'s own default proposal must never HARD-hold; violations=" (:violations verdict))))))))
