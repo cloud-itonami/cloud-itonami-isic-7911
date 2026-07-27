@@ -33,7 +33,8 @@
 
   The ledger stays append-only: which booking a proposal targeted,
   which operation, on what basis, committed/held/escalated and approved
-  by whom is always a query over an immutable log.")
+  by whom is always a query over an immutable log."
+  (:require [kotoba.reservation :as res]))
 
 (defprotocol Store
   (booking [s booking-id] "Registered booking/vendor-contract
@@ -48,6 +49,13 @@
 
 ;; ----------------------------- demo data -----------------------------
 
+(defn- settlement-plan
+  "One filed per-unit settlement rate -- `kotoba.reservation` ground
+  truth the governor recomputes a settlement amount from. Integer minor
+  units (USD cents)."
+  [id per-unit]
+  (res/rate-plan id :unit per-unit "USD" :min-units 1))
+
 (defn demo-data
   "A small, self-contained booking directory covering both the happy
   path and the governor's own hard checks, so the actor + tests run
@@ -55,11 +63,14 @@
   []
   {:bookings
    {"bkg-1" {:booking-id "bkg-1" :name "Round-trip flight + hotel package, Tanaka family, 2026-08-01"
-             :kind :customer-booking :registered? true :verified? true}
+             :kind :customer-booking :registered? true :verified? true
+             :billable-units 40 :rate-plan (settlement-plan "bkg-1-rate" 2500)}
     "bkg-2" {:booking-id "bkg-2" :name "Vendor hotel-B settlement contract, quarterly reconciliation"
-             :kind :vendor-contract :registered? true :verified? true}
+             :kind :vendor-contract :registered? true :verified? true
+             :billable-units 400 :rate-plan (settlement-plan "bkg-2-rate" 6000)}
     "bkg-3" {:booking-id "bkg-3" :name "Multi-city flight itinerary, awaiting payment verification"
-             :kind :customer-booking :registered? true :verified? false}}})
+             :kind :customer-booking :registered? true :verified? false
+             :billable-units 10 :rate-plan (settlement-plan "bkg-3-rate" 3000)}}})
 
 ;; ----------------------------- MemStore (default) -----------------------------
 

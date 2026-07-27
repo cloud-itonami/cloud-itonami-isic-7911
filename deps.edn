@@ -1,6 +1,11 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/langgraph
-        {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}}
+        {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}
+        ;; the settlement amount is recomputed from the booking's own
+        ;; filed rate plan rather than read out of the advisor's proposal.
+        ;; kotoba.reservation is integer-only so that recompute is exact.
+        io.github.kotoba-lang/reservation
+        {:git/sha "715c414544862646acd789da5d564951d05bea75"}}
  :aliases
  {:dev {:override-deps
         {io.github.kotoba-lang/langgraph
