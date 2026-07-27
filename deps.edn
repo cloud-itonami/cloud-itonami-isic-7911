@@ -5,7 +5,7 @@
         ;; filed rate plan rather than read out of the advisor's proposal.
         ;; kotoba.reservation is integer-only so that recompute is exact.
         io.github.kotoba-lang/reservation
-        {:git/sha "715c414544862646acd789da5d564951d05bea75"}}
+        {:git/sha "c27ee70434be8db34390f7de12e8294a15dac100"}}
  :aliases
  {:dev {:override-deps
         {io.github.kotoba-lang/langgraph
