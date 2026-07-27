@@ -13,6 +13,27 @@ qualified agency so it keeps its own bonding and consumer-protection
 compliance history instead of renting a closed travel-booking
 platform.
 
+## The settlement amount is recomputed, not read
+
+`:coordinate-vendor-settlement` proposals carry an `:estimated-amount`,
+and a threshold escalates large settlements to a human. Until now that
+gate read the amount **straight out of the advisor's own proposal** —
+the gate's only input was the number it existed to guard against. Two
+consequences, both closed:
+
+- an advisor stating a figure just under the threshold for a far larger
+  settlement bypassed the human escalation entirely;
+- `some->` on a missing `:estimated-amount` returned nil, so a proposal
+  carrying **no amount at all** escalated to nobody.
+
+Entities now carry a filed per-unit rate and a billable-unit count, and
+`recomputed-settlement` derives the amount from those via
+[`kotoba.reservation`](https://github.com/kotoba-lang/reservation). The
+mismatch gate is HARD and the threshold is applied to the **recomputed**
+amount, so understating cannot buy its way under it. A settlement that
+cannot be recomputed is itself a HARD violation.
+
+
 ## Scope note: booking intermediary, not a carrier or a package organizer
 
 `cloud-itonami-isic-5110` (passenger air), `cloud-itonami-isic-4911`/
