@@ -5,13 +5,27 @@
         ;; filed rate plan rather than read out of the advisor's proposal.
         ;; kotoba.reservation is integer-only so that recompute is exact.
         io.github.kotoba-lang/reservation
-        {:git/sha "c27ee70434be8db34390f7de12e8294a15dac100"}}
+        {:git/sha "c27ee70434be8db34390f7de12e8294a15dac100"}
+        ;; A travel agency is an INTERMEDIARY: it shops third-party
+        ;; inventory rather than selling its own. `reservation` prices one
+        ;; operator's own rate plan and cannot answer "which flights
+        ;; actually connect" or "was that really the cheapest". These two
+        ;; do, and the governor re-runs both rather than restating the
+        ;; advisor -- see `fare-search-violations` (ADR-2608039960).
+        io.github.kotoba-lang/itinerary
+        {:git/sha "ede40969df1076e244393dfaaa5460bcf84df526"}
+        io.github.kotoba-lang/fare
+        {:git/sha "2d41bfbc5cce903d4ad93a1e1b8543008e9f6541"}}
  :aliases
  {:dev {:override-deps
         {io.github.kotoba-lang/langgraph
          {:local/root "../../kotoba-lang/langgraph"}
          io.github.kotoba-lang/langchain
-         {:local/root "../../kotoba-lang/langchain"}}}
+         {:local/root "../../kotoba-lang/langchain"}
+         io.github.kotoba-lang/itinerary
+         {:local/root "../../kotoba-lang/itinerary"}
+         io.github.kotoba-lang/fare
+         {:local/root "../../kotoba-lang/fare"}}}
   :run {:main-opts ["-m" "travelagency.sim"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner

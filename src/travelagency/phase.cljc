@@ -15,6 +15,9 @@
                                       may auto-commit.
                                       `:flag-transaction-concern` NEVER
                                       auto-commits, at any phase.
+    Phase 4  supervised shopping  -- adds `:search-fares` (quoting a
+                                      traveler an itinerary and a fare).
+                                      Still never auto-commits.
 
   `:flag-transaction-concern` is deliberately ABSENT from every phase's
   `:auto` set, including phase 3 -- a permanent structural fact, not a
@@ -22,15 +25,23 @@
   guardrail, ADR-2607152500). Flagging a payment-dispute/cancellation/
   fraud concern always needs a human to actually look at it.
   `travelagency.governor`'s own `always-escalate-ops` enforces the same
-  invariant independently -- two layers, not one, agree on this."
+  invariant independently -- two layers, not one, agree on this.
+
+  `:search-fares` sits in a phase of its own, ABOVE the back-office ops
+  rather than beside them, so an agency can run this actor's
+  coordination side without ever enabling it to quote a traveler
+  (the same shape ADR-2800002200 gave `cloud-itonami-isic-5110`'s
+  commercial ops). It is likewise absent from every `:auto` set: it
+  moves no money and holds no inventory, but a quoted fare is a
+  commercial statement a traveler will rely on, so a human sees it."
   (:require [travelagency.governor :as governor]))
 
 (def read-ops #{})
 (def write-ops governor/allowed-ops)
 
-;; NOTE the invariant: `:flag-transaction-concern` is a member of
-;; `write-ops` (governor-gated like any write) but is NEVER a member of
-;; any phase's `:auto` set below. Do not add it there.
+;; NOTE the invariant: `:flag-transaction-concern` and `:search-fares`
+;; are members of `write-ops` (governor-gated like any write) but are
+;; NEVER members of any phase's `:auto` set below. Do not add them.
 (def phases
   "phase -> {:label .. :writes <ops allowed to write> :auto <ops
   allowed to auto-commit when governor-clean>}."
@@ -38,7 +49,10 @@
    1 {:label "assisted-logging"       :writes #{:log-booking-record}                                             :auto #{}}
    2 {:label "assisted-coordination"  :writes #{:log-booking-record :schedule-booking-operation
                                                 :coordinate-vendor-settlement}                                    :auto #{}}
-   3 {:label "supervised-auto"        :writes write-ops
+   3 {:label "supervised-auto"        :writes #{:log-booking-record :schedule-booking-operation
+                                                :coordinate-vendor-settlement :flag-transaction-concern}
+      :auto #{:log-booking-record :schedule-booking-operation :coordinate-vendor-settlement}}
+   4 {:label "supervised-shopping"    :writes write-ops
       :auto #{:log-booking-record :schedule-booking-operation :coordinate-vendor-settlement}}})
 
 (def default-phase 3)

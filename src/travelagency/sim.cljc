@@ -11,9 +11,17 @@
   but not yet verified, a proposal whose own `:effect` is not
   `:propose`, and a proposal that has drifted into the
   permanently-excluded payment-dispute-resolution-finalization /
-  refund-cancellation-policy-override-finalization scope."
-  (:require [langgraph.graph :as g]
+  refund-cancellation-policy-override-finalization scope.
+
+  Then the shopping op (`:search-fares`, phase 4): the market recomputed
+  from the booking's own schedule and filed fares, an honest quote
+  escalating to a human, and the three ways an advisor gets a fare
+  search wrong -- a fabricated total, an illegal connection, and a false
+  `cheapest` claim -- each caught by a different rule (ADR-2608039960)."
+  (:require [kotoba.itinerary :as itin]
+            [langgraph.graph :as g]
             [travelagency.advisor :as advisor]
+            [travelagency.governor :as governor]
             [travelagency.store :as store]
             [travelagency.operation :as op]))
 
@@ -81,6 +89,41 @@
     (println (exec-op actor "t9" {:op :log-booking-record :booking-id "bkg-1"
                                    :out-of-scope? true
                                    :patch {}} manager-phase-3))
+
+    ;; ---- shopping (phase 4) -- the op that faces the traveler ----
+    (let [manager-phase-4 {:actor-id "mgr-1" :actor-role :travel-agency-manager :phase 4}
+          market (governor/recomputed-market db "bkg-1")]
+      (println "\n== the market, recomputed from bkg-1's OWN schedule and filed fares ==")
+      (doseq [it (:itineraries market)]
+        (println "  itinerary" (mapv :leg/id (:itin/legs it))
+                 (str (itin/elapsed-minutes it) "min")))
+      (doseq [s (get-in market [:search :search/solutions])]
+        (println "  priced   " (:price/total s) (:price/currency s)
+                 (mapv #(get-in % [:pc/fare :fare/basis]) (:price/components s))))
+
+      (println "\n== search-fares bkg-1 (phase 3 -- shopping not enabled yet -> HOLD) ==")
+      (println (exec-op actor "t10" {:op :search-fares :booking-id "bkg-1" :patch {}} manager-phase-3))
+
+      (println "\n== search-fares bkg-1 (phase 4, honest quote -- ALWAYS escalates, never auto) ==")
+      (let [r (exec-op actor "t11" {:op :search-fares :booking-id "bkg-1" :patch {}} manager-phase-4)]
+        (println r)
+        (println "-- human travel-agency manager approves the quote --")
+        (println (approve! actor "t11")))
+
+      (println "\n== search-fares bkg-1, advisor states a fare nobody filed -> HARD hold ==")
+      (println (exec-op actor "t12" {:op :search-fares :booking-id "bkg-1"
+                                     :patch {:fabricate 54800}} manager-phase-4))
+
+      (println "\n== search-fares bkg-1, advisor proposes a 15-minute TPE connection -> HARD hold ==")
+      (println (exec-op actor "t13" {:op :search-fares :booking-id "bkg-1"
+                                     :patch {:illegal? true}} manager-phase-4))
+
+      (println "\n== search-fares bkg-1, legal + correctly priced, but falsely claimed cheapest -> HARD hold ==")
+      (println (exec-op actor "t14" {:op :search-fares :booking-id "bkg-1"
+                                     :patch {:overquote? true}} manager-phase-4))
+
+      (println "\n== search-fares bkg-2 (no schedule/fares on file -> un-recomputable, HARD hold) ==")
+      (println (exec-op actor "t15" {:op :search-fares :booking-id "bkg-2" :patch {}} manager-phase-4)))
 
     (println "\n== audit ledger ==")
     (doseq [f (store/ledger db)] (println f))

@@ -6,6 +6,6 @@
  :itonami.blueprint/social-impact [:consumer-protection :local-jobs :access-to-travel]
  :itonami.blueprint/governor :travel-agency-governor
  :itonami.blueprint/robotics true
- :itonami.blueprint/required-technologies [:reservation :robotics :identity :forms :dmn :bpmn :audit-ledger :labor]
+ :itonami.blueprint/required-technologies [:reservation :fare-shopping :robotics :identity :forms :dmn :bpmn :audit-ledger :labor]
  :itonami.blueprint/optional-technologies [:optimization]
  :itonami.blueprint/status :public-oss}
