@@ -68,6 +68,41 @@
                                        authorized to propose) and is
                                        folded into this same check.
 
+  Three further HARD checks apply to the SHOPPING op (`:search-fares`),
+  and they are the same kind of check as the settlement recompute below
+  -- ground-truth RECOMPUTES, never restatements of what the advisor
+  claimed:
+
+    4. Itinerary illegal           -- re-run `kotoba.itinerary/violations`
+                                       on the proposed leg sequence,
+                                       resolved from the BOOKING'S OWN
+                                       schedule, against the booking's own
+                                       minimum-connect-time table. A
+                                       language model reading a timetable
+                                       will propose a 15-minute interline
+                                       connection without hesitating.
+    5. Fare price mismatch         -- re-run `kotoba.fare/search` over
+                                       that one itinerary and reject a
+                                       stated total that is not what the
+                                       filed fares actually add to.
+    6. Not the cheapest fare       -- when, and only when, the proposal
+                                       CLAIMS `:cheapest? true`, re-run
+                                       the search over every itinerary
+                                       the schedule supports and reject
+                                       the claim if anything prices lower.
+
+  Checks 5 and 6 are deliberately separate. A traveler may legitimately
+  be quoted a nonstop that is not the cheapest thing in the market --
+  that is a preference, not a lie. Quoting an arithmetic that does not
+  hold, or asserting a superlative that is false, are the two things an
+  intermediary must not do, and only the second one is about the fares
+  that were NOT chosen (ADR-2608039960).
+
+  For all three, a check that CANNOT be performed -- no shopping record
+  on the booking, a proposed leg id absent from the schedule, no stated
+  total -- is itself a HARD violation. This governor does not assume
+  compliance when it is structurally unable to verify it.
+
   One ESCALATE (SOFT) gate: LLM confidence below the floor, OR the op
   is `:flag-transaction-concern` (ALWAYS escalates to a human,
   regardless of confidence, regardless of how clean the proposal
@@ -75,8 +110,12 @@
   estimated settlement amount exceeds `high-value-threshold`.
   `travelagency.phase` independently agrees: `:flag-transaction-concern`
   is never a member of any phase's `:auto` set either -- two layers,
-  not one."
+  not one. `:search-fares` is likewise never a member of any `:auto`
+  set: it moves nothing, but a quoted fare is a commercial statement a
+  traveler will rely on."
   (:require [clojure.string :as str]
+            [kotoba.fare :as fare]
+            [kotoba.itinerary :as itin]
             [kotoba.reservation :as res]
             [travelagency.store :as store]))
 
@@ -100,7 +139,8 @@
   `:flag-transaction-concern` always escalates rather than ever
   auto-committing."
   #{:log-booking-record :schedule-booking-operation
-    :coordinate-vendor-settlement :flag-transaction-concern})
+    :coordinate-vendor-settlement :flag-transaction-concern
+    :search-fares})
 
 (def always-escalate-ops
   "Ops that ALWAYS require human sign-off, clean or not."
@@ -133,8 +173,20 @@
    "finalize the cancellation policy override" "grant the cancellation policy override"
    "override the cancellation policy" "override cancellation policy"
    "bypass the cancellation policy" "bypass cancellation policy"
+   ;; Added with `:search-fares`. Shopping a fare is this agency's core
+   ;; business; ISSUING the ticket is the airline's or the settlement
+   ;; system's, and a search proposal that claims to have done it has
+   ;; drifted exactly as far out of scope as one claiming to have closed
+   ;; a chargeback. Phrased as actions for the same reason every entry
+   ;; above is: a legitimate proposal must stay free to *mention* a
+   ;; ticket, a fare or a booking class.
+   "issue the ticket" "issue the tickets" "issue a ticket for"
+   "finalize the ticket issuance" "finalize ticket issuance"
+   "confirm the ticket issuance" "complete the ticket issuance"
+   "file the fare with" "file this fare with"
    "支払い紛争解決を確定" "決済紛争の解決を確定" "支払い紛争を確定的に解決"
-   "返金の上書きを確定" "返金上書きを確定" "キャンセルポリシーの上書きを確定" "キャンセルポリシーを上書き"])
+   "返金の上書きを確定" "返金上書きを確定" "キャンセルポリシーの上書きを確定" "キャンセルポリシーを上書き"
+   "発券を確定" "発券を完了" "航空券を発券する" "運賃を届け出る"])
 
 ;; ----------------------------- checks -----------------------------
 
@@ -225,6 +277,115 @@
         [{:rule :settlement-mismatch
           :detail (str "提示精算額 " claimed " は届出レートからの再計算結果 " truth " と一致しない")}]))))
 
+;; ------------------- shopping recompute (`:search-fares`) -------------------
+
+(defn shopping-record
+  "The booking's OWN schedule / fares / MCT table / pricing context.
+  nil when the booking carries no shopping record, which makes every
+  check below un-performable and therefore a violation."
+  [store id]
+  (when store (:shopping (store/booking store id))))
+
+(def ^:private shopping-of shopping-record)
+
+(defn resolve-itinerary
+  "Rebuild the proposed itinerary from the BOOKING'S OWN schedule.
+
+  The proposal names leg ids; it does not get to supply leg data. An
+  advisor that could hand over its own departure times would be
+  supplying the very facts the legality check exists to test, and the
+  check would be verifying the advisor against itself. Returns nil when
+  any named leg is absent from the schedule -- an itinerary built from
+  flights this agency was never given a schedule for cannot be
+  verified, so it is not accepted."
+  [shopping leg-ids]
+  (let [by-id (into {} (map (juxt :leg/id identity)) (:schedule shopping))
+        legs (mapv #(get by-id %) leg-ids)]
+    (when (and (seq leg-ids) (every? some? legs))
+      (itin/itinerary legs))))
+
+(defn- search-opts [shopping]
+  (:pricing shopping))
+
+(defn recomputed-market
+  "Every itinerary the booking's own schedule legally supports, priced
+  from its own filed fares. `{:itineraries [..] :search {..}}`, or nil
+  when there is nothing to recompute from.
+
+  This is the market the `:cheapest?` claim is judged against. It is
+  derived here, from the store, and never read off the proposal."
+  [store id]
+  (when-let [sh (shopping-of store id)]
+    (let [{:keys [origin destination]} (:journey sh)]
+      (when (and origin destination (seq (:schedule sh)) (seq (:fares sh)))
+        (let [built (itin/build (:schedule sh)
+                                {:origin origin :destination destination
+                                 :mct-table (:mct sh)})
+              its (:itin/results built)]
+          {:itineraries its
+           :search (fare/search its (:fares sh) (search-opts sh))})))))
+
+(defn- fare-search-violations
+  "RECOMPUTE a `:search-fares` proposal: is the itinerary legal, does
+  the stated total match what the filed fares add to, and -- only if
+  the proposal says so -- is it really the cheapest.
+
+  Every input comes from the booking's own record. A check that cannot
+  be run is a violation, never a pass."
+  [proposal store]
+  (when (= :search-fares (:op proposal))
+    (let [id (:booking-id proposal)
+          sh (shopping-of store id)
+          {:keys [itinerary total cheapest?]} (:value proposal)
+          it (when sh (resolve-itinerary sh itinerary))
+          journey (:journey sh)]
+      (cond
+        (nil? sh)
+        [{:rule :fare-search-not-recomputable
+          :detail (str id " に時刻表/届出運賃(shopping record)が無い -- 提示運賃を独立に再計算できない")}]
+
+        (or (nil? itinerary) (nil? total))
+        [{:rule :fare-search-not-recomputable
+          :detail "提案に :itinerary(leg id 列)または :total が無い -- 独立検証できない運賃は承認しない"}]
+
+        (nil? it)
+        [{:rule :fare-search-not-recomputable
+          :detail (str "提案の leg " (pr-str itinerary) " は " id
+                       " の時刻表に無い -- 与えられていない便の旅程は検証できない")}]
+
+        :else
+        (let [violations (itin/violations it {:origin (:origin journey)
+                                              :destination (:destination journey)
+                                              :mct-table (:mct sh)})
+              market (recomputed-market store id)
+              this-one (fare/cheapest (fare/search [it] (:fares sh) (search-opts sh)))]
+          (cond
+            (seq violations)
+            [{:rule :itinerary-illegal
+              :detail (str "提案された旅程は成立しない: "
+                           (str/join " / " (map itin/describe-violation violations)))}]
+
+            (nil? this-one)
+            [{:rule :fare-search-not-recomputable
+              :detail "提案された旅程に適用可能な届出運賃が無い -- 価格を再計算できない"}]
+
+            (not= total (:price/total this-one))
+            [{:rule :fare-price-mismatch
+              :detail (str "提示総額 " total " は届出運賃からの再計算結果 "
+                           (:price/total this-one) " と一致しない")}]
+
+            ;; Only checked when the advisor actually asserts it. A
+            ;; traveler may be quoted a non-cheapest itinerary on
+            ;; purpose; asserting falsely that it is the cheapest is
+            ;; the thing that is not allowed.
+            (and cheapest?
+                 (not (fare/cheapest-matches-claim?
+                       (:itineraries market) (:fares sh) (search-opts sh) total)))
+            [{:rule :not-the-cheapest-fare
+              :detail (str "最安と主張された " total " より安い "
+                           (:price/total (fare/cheapest (:search market)))
+                           " が同じ時刻表・同じ届出運賃から成立する")}]))))))
+
 (defn- high-value-vendor-settlement?
   "A `:coordinate-vendor-settlement` whose RECOMPUTED amount exceeds
   `high-value-threshold` ALWAYS escalates, regardless of confidence.
@@ -244,7 +405,8 @@
                    (concat (booking-unverified-violations {:booking-id booking-id} store)
                            (effect-not-propose-violations proposal)
                            (scope-exclusion-violations proposal)
-                           (settlement-recompute-violations proposal store)))
+                           (settlement-recompute-violations proposal store)
+                           (fare-search-violations proposal store)))
         conf (:confidence proposal 0.0)
         low? (< conf confidence-floor)
         stakes? (boolean (or (always-escalate-ops (:op proposal))

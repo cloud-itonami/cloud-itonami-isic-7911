@@ -5,11 +5,13 @@
   transfers as an intermediary on behalf of travelers) operations-
   coordination actor.
 
-  It drafts exactly four kinds of back-office proposal from a closed
-  allowlist: booking/itinerary/payment-status record logging,
-  booking/confirmation scheduling, airline/hotel/vendor settlement
-  coordination, and payment-dispute/cancellation/fraud concern
-  flagging. CRITICAL: it is a smart-but-untrusted advisor. It returns
+  It drafts exactly five kinds of proposal from a closed allowlist:
+  booking/itinerary/payment-status record logging, booking/confirmation
+  scheduling, airline/hotel/vendor settlement coordination,
+  payment-dispute/cancellation/fraud concern flagging, and -- the one
+  op that faces the traveler rather than the back office -- a fare
+  search quoting an itinerary and a price. CRITICAL: it is a
+  smart-but-untrusted advisor. It returns
   a *proposal* (with a rationale + the fields it cited), never a
   committed record and NEVER a direct actuation -- every proposal's
   `:effect` is always `:propose`. Every output is censored downstream
@@ -110,6 +112,66 @@
    :value      (merge {:booking-id booking-id} patch)
    :confidence (or (:confidence patch) 0.85)})
 
+(defn- propose-fare-search
+  "Draft a fare quote for a traveler: an itinerary (as leg ids off the
+  booking's own schedule) plus the total it prices at.
+
+  This is the op that made `kotoba-lang/itinerary` and
+  `kotoba-lang/fare` necessary (ADR-2608039960). A travel agency is an
+  intermediary -- it shops third-party inventory it does not own -- so
+  neither `kotoba.reservation` (one operator's own rate plan) nor a
+  settlement rate answers what it needs to say to a traveler.
+
+  The mock prices honestly by default: it re-runs the search over the
+  booking's own record and quotes the result. `patch` carries three
+  deliberate failure hooks, each of which the governor catches with a
+  DIFFERENT rule, because they are genuinely different lies:
+
+    :fabricate  -- state a plausible total nobody's filed fares support
+    :illegal?   -- propose the 15-minute Taipei interline connection
+    :overquote? -- quote a legal, correctly-priced, non-cheapest
+                   itinerary while asserting it is the cheapest"
+  [db {:keys [booking-id patch]}]
+  (let [{:keys [fabricate illegal? overquote?]} patch
+        market (governor/recomputed-market db booking-id)
+        solutions (get-in market [:search :search/solutions])
+        best (first solutions)
+        alt (second solutions)
+        chosen (if overquote? (or alt best) best)
+        legs (fn [s] (mapv :leg/id (get-in s [:search/itinerary :itin/legs])))
+        ;; Leg ids are looked up from the schedule by carrier + number
+        ;; rather than spelled out. `kotoba.itinerary` derives a default
+        ;; id from the departure instant, so a literal here would be a
+        ;; timetable change away from silently naming nothing -- and a
+        ;; proposal naming nothing is caught as un-recomputable, which
+        ;; would quietly stop exercising the check it exists to exercise.
+        leg-id (fn [carrier number]
+                 (->> (get-in (governor/shopping-record db booking-id) [:schedule])
+                      (some #(when (and (= carrier (:leg/carrier %))
+                                        (= number (:leg/number %)))
+                               (:leg/id %)))))
+        value (cond
+                illegal?
+                ;; NH853 then CI751 -- 15 minutes on the ground at TPE.
+                {:booking-id booking-id
+                 :itinerary [(leg-id "NH" "853") (leg-id "CI" "751")]
+                 :total (:price/total best) :cheapest? true}
+
+                :else
+                {:booking-id booking-id
+                 :itinerary (legs chosen)
+                 :total (or fabricate (:price/total chosen))
+                 :cheapest? true})]
+    {:op         :search-fares
+     :booking-id booking-id
+     :summary    (str booking-id " の運賃検索結果: " (pr-str (:itinerary value))
+                      " 総額 " (:total value))
+     :rationale  "旅客の依頼区間について、当社が受領した時刻表と届出運賃から旅程と運賃を提示する提案のみ。発券・決済・運賃の届出は行わない。"
+     :cites      [booking-id]
+     :effect     :propose
+     :value      value
+     :confidence 0.91}))
+
 ;; ----------------------------- default mock advisor -----------------------------
 
 (defn infer
@@ -120,6 +182,7 @@
                    :schedule-booking-operation (propose-booking-operation _db request)
                    :coordinate-vendor-settlement (propose-vendor-settlement _db request)
                    :flag-transaction-concern (propose-transaction-concern _db request)
+                   :search-fares (propose-fare-search _db request)
                    {})]
     ;; Test hook: allow injecting scope-excluded content to exercise the
     ;; governor's scope-exclusion block end-to-end. Must be cleared before
