@@ -176,8 +176,14 @@
            :booking-id (:booking-id request)
            :gate-disposition d1
            :disposition (get-in final [:state :disposition])
-           :audit (vec (concat (get-in r1 [:state :audit])
-                               (when r2 (get-in r2 [:state :audit]))))
+           ;; The audit channel is declared `{:reducer into}` and a resumed
+           ;; run replays from the checkpoint, so the resumed state's audit
+           ;; ALREADY contains every pre-interrupt fact. Concatenating the
+           ;; two runs' audits would therefore report each
+           ;; :approval-requested twice and make one approval look like two.
+           ;; Measured, not assumed -- see the `CUMULATIVE?` probe in the
+           ;; commit that introduced this line.
+           :audit (vec (get-in final [:state :audit]))
            :resumed? (some? r2))))
 
 (defn run-demo!
