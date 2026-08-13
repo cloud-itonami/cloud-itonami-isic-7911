@@ -1,0 +1,670 @@
+(ns travelagency.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 for this repo: before this namespace
+  existed there was no demo page and no generator at all. Everything on
+  the rendered page is produced by driving the REAL actor stack --
+  `travelagency.advisor` -> `travelagency.governor` ->
+  `travelagency.phase` -> `travelagency.store`, wired together as the
+  langgraph StateGraph that `travelagency.operation/build` compiles, and
+  executed with `langgraph.graph/run*` exactly as
+  `travelagency.sim` (`clojure -M:dev:run`) does. Nothing on the page is
+  hand-typed telemetry: every booking row is read back out of
+  `store/all-bookings`, every settlement figure is a live
+  `governor/recomputed-settlement` call, every market row is a live
+  `governor/recomputed-market` call, every ledger and hold row is read
+  back out of `store/ledger` after the run, every coordination row is
+  read back out of `store/coordination-log`, and the phase ladder is
+  projected from the `travelagency.phase/phases` var itself rather than
+  restated in prose.
+
+  Determinism: the store is an in-memory seed (`store/seed-db`), the
+  advisor is the deterministic mock, and no clock, hostname, random
+  source or run counter reaches the page. Two consecutive runs are
+  byte-identical -- verify with
+  `clojure -M:dev:render-html $(mktemp -d)/a.html` twice and `cmp`.
+  Any map printed into a cell goes through `kv-str`, which sorts by key
+  name, so a map that grows past Clojure's array-map threshold and turns
+  into a hash-map cannot silently reorder a column.
+
+  Build-time invariant: `-main` THROWS if the scenario produced no HARD
+  governor hold. A console for a governed actor that shows only happy
+  paths is worse than no console -- it advertises a governor nobody
+  watched refuse anything. The check is on the store ledger written by
+  the real run, so it cannot be satisfied by editing this file's prose.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [jp-go-dds.skin]
+            [kotoba.itinerary :as itin]
+            [langgraph.graph :as g]
+            [travelagency.advisor :as advisor]
+            [travelagency.governor :as governor]
+            [travelagency.operation :as op]
+            [travelagency.phase :as phase]
+            [travelagency.store :as store]))
+
+;; ----------------------------- the scenario -----------------------------
+
+(def ^:private manager "mgr-1")
+(def ^:private approver "travel-agency-manager-1")
+
+(defn- ctx [ph]
+  {:actor-id manager :actor-role :travel-agency-manager :phase ph})
+
+(def scenario
+  "The scenario, as data, so the run and the page cannot drift apart.
+
+  Each step is one full actor run against the shared seeded store. It
+  covers, in order: the phase-1 approval path, the phase-3 auto-commit
+  path, the always-escalate paths (transaction concern; a settlement
+  whose RECOMPUTED amount clears the high-value threshold), one
+  deliberately-unresolved escalation left awaiting a human, and then
+  every HARD governor rule this actor can reach -- an unregistered
+  booking, a registered-but-unverified booking, an advisor claiming a
+  direct actuation, an advisor drifted into permanently excluded scope,
+  an understated settlement that would otherwise have slipped under the
+  escalation threshold, and the four fare-search recompute rules
+  (un-priceable, fabricated total, illegal connection, false `cheapest`
+  claim).
+
+  `:approve?` means a human approver resumes the interrupted run.
+  Steps without it that escalate are left pending on purpose."
+  [{:thread "t1" :phase 1 :approve? true
+    :label "Booking record logged at phase 1 -- assisted logging, every write needs a human"
+    :request {:op :log-booking-record :booking-id "bkg-1"
+              :patch {:traveler "Tanaka" :segments 2 :status "booked"}}}
+
+   {:thread "t2" :phase 3
+    :label "Same op at phase 3 -- governor-clean and auto-eligible, so it commits with no human"
+    :request {:op :log-booking-record :booking-id "bkg-1"
+              :patch {:traveler "Tanaka" :status "checked-in"}}}
+
+   {:thread "t3" :phase 3
+    :label "Booking-operation scheduling at phase 3 -- clean, auto-commits"
+    :request {:op :schedule-booking-operation :booking-id "bkg-1"
+              :patch {:item "itinerary segment reconfirmation" :urgency "routine"}}}
+
+   {:thread "t4" :phase 3
+    :label "Vendor settlement whose recomputed amount clears the high-value threshold -- escalated and LEFT PENDING"
+    :request {:op :coordinate-vendor-settlement :booking-id "bkg-2"
+              :patch {:item "hotel-B quarterly reconciliation"}}}
+
+   {:thread "t5" :phase 3 :approve? true
+    :label "The same settlement, this time approved by a human"
+    :request {:op :coordinate-vendor-settlement :booking-id "bkg-2"
+              :patch {:item "annual bulk settlement run"}}}
+
+   {:thread "t6" :phase 3 :approve? true
+    :label "Transaction concern -- ALWAYS escalates at every phase, never auto-eligible"
+    :request {:op :flag-transaction-concern :booking-id "bkg-1"
+              :patch {:concern "possible duplicate charge reported by traveler for bkg-1"
+                      :confidence 0.92}}}
+
+   {:thread "t7" :phase 3
+    :label "Unregistered booking -- HARD hold, no human can override it"
+    :request {:op :log-booking-record :booking-id "bkg-99" :patch {:traveler "unknown"}}}
+
+   {:thread "t8" :phase 3
+    :label "Registered but not yet payment-verified -- HARD hold on the store's own flags"
+    :request {:op :log-booking-record :booking-id "bkg-3" :patch {:traveler "unknown"}}}
+
+   {:thread "t9" :phase 3 :advisor-claims-actuation? true
+    :label "Advisor returns :effect :commit, claiming to actuate directly -- HARD hold"
+    :request {:op :schedule-booking-operation :booking-id "bkg-1"
+              :patch {:item "seat reassignment"}}}
+
+   {:thread "t10" :phase 3
+    :label "Advisor drifts into payment-dispute / refund-override finalization -- HARD hold, permanent"
+    :request {:op :log-booking-record :booking-id "bkg-1" :out-of-scope? true :patch {}}}
+
+   {:thread "t11" :phase 3
+    :label "Settlement understated to just under the escalation threshold -- HARD hold on the recompute"
+    :request {:op :coordinate-vendor-settlement :booking-id "bkg-1" :understate? true
+              :patch {:item "consolidated air/hotel settlement"}}}
+
+   {:thread "t12" :phase 3
+    :label "Fare search at phase 3 -- shopping is not enabled below phase 4, so the phase gate holds it"
+    :request {:op :search-fares :booking-id "bkg-1" :patch {}}}
+
+   {:thread "t13" :phase 4 :approve? true
+    :label "Fare search at phase 4, honest quote -- never auto-eligible, so a human sees the quote"
+    :request {:op :search-fares :booking-id "bkg-1" :patch {}}}
+
+   {:thread "t14" :phase 4
+    :label "Advisor states a total nobody's filed fares support -- HARD hold"
+    :request {:op :search-fares :booking-id "bkg-1" :patch {:fabricate 54800}}}
+
+   {:thread "t15" :phase 4
+    :label "Advisor proposes a 15-minute Taipei interline connection -- HARD hold"
+    :request {:op :search-fares :booking-id "bkg-1" :patch {:illegal? true}}}
+
+   {:thread "t16" :phase 4
+    :label "Legal and correctly priced, but falsely asserted to be the cheapest -- HARD hold"
+    :request {:op :search-fares :booking-id "bkg-1" :patch {:overquote? true}}}
+
+   {:thread "t17" :phase 4
+    :label "Fare search on a booking with no schedule or filed fares -- un-recomputable, therefore HARD hold"
+    :request {:op :search-fares :booking-id "bkg-2" :patch {}}}])
+
+(defn- actuating-advisor
+  "An advisor that returns `:effect :commit` -- i.e. one claiming the
+  right to actuate directly. Used to exercise the governor's
+  `:effect-not-propose` rule end-to-end, exactly as `travelagency.sim`
+  does."
+  []
+  (reify advisor/Advisor
+    (-advise [_ db req] (assoc (advisor/infer db req) :effect :commit))))
+
+(defn- run-step!
+  "Executes one scenario step against the shared store and returns what
+  the run actually did -- never what the step intended."
+  [db default-actor {:keys [thread phase request approve? advisor-claims-actuation?] :as step}]
+  (let [actor (if advisor-claims-actuation?
+                (op/build db {:advisor (actuating-advisor)})
+                default-actor)
+        r1 (g/run* actor {:request request :context (ctx phase)} {:thread-id thread})
+        d1 (get-in r1 [:state :disposition])
+        r2 (when (and approve? (= :escalate d1))
+             (g/run* actor {:approval {:status :approved :by approver}}
+                     {:thread-id thread :resume? true}))
+        final (or r2 r1)]
+    (assoc (select-keys step [:thread :label :phase])
+           :op (:op request)
+           :booking-id (:booking-id request)
+           :gate-disposition d1
+           :disposition (get-in final [:state :disposition])
+           :audit (vec (concat (get-in r1 [:state :audit])
+                               (when r2 (get-in r2 [:state :audit]))))
+           :resumed? (some? r2))))
+
+(defn run-demo!
+  "Runs the whole scenario against one freshly seeded store and returns
+  `{:db .. :steps ..}`. `:db` is the real post-run store -- its ledger
+  and coordination log are the only thing the page's run-derived
+  sections are allowed to read."
+  []
+  (let [db (store/seed-db)
+        actor (op/build db)]
+    {:db db
+     :steps (mapv #(run-step! db actor %) scenario)}))
+
+;; ----------------------------- rendering helpers -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- kv-str
+  "Render a map deterministically: sorted by key name, so a map that
+  grows past the array-map threshold and becomes a hash-map cannot
+  silently reorder a table cell between runs."
+  [m]
+  (->> m
+       (sort-by (comp str key))
+       (map (fn [[k v]] (str (name k) " " (pr-str v))))
+       (str/join " · ")))
+
+(defn- yn [b] (if b "yes" "no"))
+
+(defn- tag [class text] (str "<span class=\"" class "\">" text "</span>"))
+
+(defn- row [& cells]
+  (str "        <tr>" (str/join (map #(str "<td>" % "</td>") cells)) "</tr>"))
+
+(defn- table [headers rows]
+  (str "    <table>\n"
+       "      <thead><tr>" (str/join (map #(str "<th>" (esc %) "</th>") headers)) "</tr></thead>\n"
+       "      <tbody>\n"
+       (if (seq rows) (str (str/join "\n" rows) "\n") "")
+       "      </tbody>\n"
+       "    </table>\n"))
+
+(defn- section [title note body]
+  (str "  <section class=\"card\">\n"
+       "    <h2>" (esc title) "</h2>\n"
+       (if note (str "    <p class=\"muted\">" note "</p>\n") "")
+       body
+       "  </section>\n"))
+
+(defn- hard-hold?
+  "A HARD governor hold: a `:governor-hold` fact carrying at least one
+  actual rule violation. A phase gate can also write a `:governor-hold`
+  fact (with an empty `:violations` and a `:phase-reason`); that is a
+  rollout decision, not a compliance refusal, and is counted separately
+  everywhere on this page."
+  [f]
+  (and (= :governor-hold (:t f)) (seq (:violations f))))
+
+(defn- phase-hold? [f]
+  (and (= :governor-hold (:t f)) (empty? (:violations f)) (:phase-reason f)))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- bookings-section
+  "Read back out of `store/all-bookings`; the settlement column is a
+  live `governor/recomputed-settlement` call against each booking's own
+  filed rate plan -- the same call the high-value gate makes."
+  [db]
+  (section
+   "Booking / vendor-contract directory"
+   (str "Read back from <code>travelagency.store/all-bookings</code> after the run. "
+        "The settlement column is not stored on the record: it is recomputed per row by "
+        "<code>governor/recomputed-settlement</code> from the booking&rsquo;s own filed rate plan "
+        "&times; its billable units &mdash; the identical call the high-value escalation gate makes, "
+        "so what you see here is what the governor sees.")
+   (table ["Booking" "Description" "Kind" "Registered" "Payment-verified" "Billable units"
+           "Recomputed settlement" "Shopping record"]
+          (for [b (store/all-bookings db)
+                :let [total (governor/recomputed-settlement db (:booking-id b))]]
+            (row (str "<code>" (esc (:booking-id b)) "</code>")
+                 (esc (:name b))
+                 (esc (name (:kind b)))
+                 (tag (if (:registered? b) "ok" "critical") (yn (:registered? b)))
+                 (tag (if (:verified? b) "ok" "critical") (yn (:verified? b)))
+                 (esc (:billable-units b))
+                 (if total (esc total) (tag "muted" "not recomputable"))
+                 (if (:shopping b)
+                   (tag "ok" "present")
+                   (tag "muted" "none — fare search un-recomputable")))))))
+
+(defn- market-section
+  "The market the governor judges every `:search-fares` claim against,
+  recomputed live from the booking's own schedule and filed fares."
+  [db booking-id]
+  (let [market (governor/recomputed-market db booking-id)
+        solutions (get-in market [:search :search/solutions])]
+    (section
+     (str "Recomputed market for " booking-id)
+     (str "Produced live by <code>governor/recomputed-market</code>: every itinerary "
+          (esc booking-id) "&rsquo;s own schedule legally supports under its own minimum-connect-time "
+          "table, priced from its own filed fares. This is ground truth derived from the store, never "
+          "read off a proposal &mdash; a governor that priced from the advisor&rsquo;s numbers would be "
+          "checking the advisor against itself. The schedule also contains a CI751 departure 15 minutes "
+          "after NH853 lands at TPE; it is absent below because the legality recompute rejects it, which "
+          "is exactly why a proposal naming it is held further down.")
+     (if (seq solutions)
+       (table ["Itinerary (leg ids from the schedule)" "Elapsed" "Total" "Currency" "Fare bases"]
+              (for [s solutions
+                    :let [it (:search/itinerary s)]]
+                (row (str "<code>"
+                          (esc (str/join " → " (map :leg/id (:itin/legs it))))
+                          "</code>")
+                     (esc (str (itin/elapsed-minutes it) " min"))
+                     (esc (:price/total s))
+                     (esc (:price/currency s))
+                     (esc (str/join ", " (map #(get-in % [:pc/fare :fare/basis])
+                                              (:price/components s)))))))
+       (str "    <p class=\"critical\">No market could be recomputed for " (esc booking-id)
+            " &mdash; omitted rather than invented.</p>\n")))))
+
+(defn- phase-ladder-section
+  "Projected from the `travelagency.phase/phases` var, so the ladder on
+  the page is the ladder the gate actually enforces."
+  []
+  (let [ops (sort-by name governor/allowed-ops)
+        phs (sort (keys phase/phases))]
+    (section
+     "Rollout phase ladder × op"
+     (str "Projected directly from the <code>travelagency.phase/phases</code> var and "
+          "<code>governor/allowed-ops</code> at build time &mdash; not a prose restatement. "
+          "<b>auto</b> = may commit with no human when the governor is clean; <b>approval</b> = enabled "
+          "but always routed to a human; <b>disabled</b> = the phase gate holds it. Two ops are absent "
+          "from every <code>:auto</code> set at every phase as a structural fact, not a milestone still "
+          "to come: <code>:flag-transaction-concern</code> and <code>:search-fares</code>. "
+          "<code>governor/always-escalate-ops</code> independently agrees about the first &mdash; two "
+          "layers, not one. Current default phase: <code>"
+          (esc phase/default-phase) "</code>.")
+     (table (into ["Op" "Always escalates (governor)"]
+                  (map #(str "Phase " % " · " (:label (get phase/phases %))) phs))
+            (for [o ops]
+              (apply row
+                     (str "<code>" (esc o) "</code>")
+                     (if (contains? governor/always-escalate-ops o)
+                       (tag "warn" "always")
+                       (tag "muted" "—"))
+                     (for [p phs
+                           :let [{:keys [writes auto]} (get phase/phases p)]]
+                       (cond
+                         (contains? auto o) (tag "ok" "auto")
+                         (contains? writes o) (tag "warn" "approval")
+                         :else (tag "muted" "disabled")))))))))
+
+(defn- steps-section
+  "What each scenario step actually did. `:gate-disposition` is what the
+  governor + phase gate decided BEFORE any human was consulted; the
+  outcome column is where the run finished."
+  [steps]
+  (section
+   "Scenario — what the actor actually did"
+   (str "One row per <code>langgraph.graph/run*</code> against the shared seeded store. "
+        "&ldquo;Gate decision&rdquo; is what the governor and phase gate concluded before any human was "
+        "consulted; &ldquo;outcome&rdquo; is where the run finished. A run that escalated and was never "
+        "resumed stays pending &mdash; it is shown as pending rather than quietly dropped.")
+   (table ["#" "Phase" "Op" "Booking" "Gate decision" "Outcome" "What this step exercises"]
+          (for [{:keys [thread phase op booking-id gate-disposition disposition resumed? label]} steps]
+            (row (str "<code>" (esc thread) "</code>")
+                 (esc phase)
+                 (str "<code>" (esc op) "</code>")
+                 (str "<code>" (esc booking-id) "</code>")
+                 (case gate-disposition
+                   :commit (tag "ok" "auto-commit")
+                   :escalate (tag "warn" "escalate to human")
+                   :hold (tag "critical" "hold")
+                   (tag "muted" (esc gate-disposition)))
+                 (cond
+                   (and (= :commit disposition) resumed?) (tag "ok" "approved &amp; committed")
+                   (= :commit disposition) (tag "ok" "committed")
+                   (= :hold disposition) (tag "critical" "held")
+                   (= :escalate disposition) (tag "warn" "pending — awaiting a human")
+                   :else (tag "muted" (esc disposition)))
+                 (esc label))))))
+
+(defn- holds-section
+  "Every HARD hold in the post-run ledger, with the rule name and the
+  governor's own detail string."
+  [ledger]
+  (let [hard (filter hard-hold? ledger)
+        phase-held (filter phase-hold? ledger)]
+    (section
+     (str "HARD governor holds — " (count hard) " in this run")
+     (str "Read back from <code>travelagency.store/ledger</code>. These are <b>permanent and "
+          "un-overridable</b>: no approval path reaches them, because the graph routes a HARD verdict "
+          "straight to <code>:hold</code> without ever offering it to a human. The detail column is the "
+          "governor&rsquo;s own message, copied from the stored violation, not paraphrased. "
+          "Distinct rules fired: <b>"
+          (esc (count (distinct (mapcat :basis hard)))) "</b>.")
+     (str
+      (table ["Op" "Booking" "Rule" "Governor's own detail" "Advisor confidence"]
+             (for [f hard, v (:violations f)]
+               (row (str "<code>" (esc (:op f)) "</code>")
+                    (str "<code>" (esc (:booking-id f)) "</code>")
+                    (str "<code>" (esc (:rule v)) "</code>")
+                    (esc (:detail v))
+                    (esc (:confidence f)))))
+      (if (seq phase-held)
+        (str "    <p class=\"muted\">Separately, " (count phase-held)
+             " run(s) were held by the <b>rollout phase gate</b> rather than by a compliance rule "
+             "(empty <code>:violations</code>, with a <code>:phase-reason</code>): "
+             (esc (str/join ", " (for [f phase-held]
+                                   (str (:op f) " on " (:booking-id f)
+                                        " → " (:phase-reason f) " at phase " (:phase f)))))
+             ". These are counted separately everywhere on this page &mdash; a rollout decision is not a "
+             "compliance refusal, and conflating them would inflate the governor&rsquo;s apparent "
+             "strictness.</p>\n")
+        "")))))
+
+(defn- ledger-section [ledger]
+  (section
+   (str "Audit ledger — " (count ledger) " facts")
+   (str "The append-only decision-fact log, read back from <code>travelagency.store/ledger</code> in "
+        "write order. Only the <code>:commit</code> and <code>:hold</code> graph nodes write here, so "
+        "this log records outcomes; the escalation handshake that preceded an approved commit lives in "
+        "the run&rsquo;s audit channel and is joined in the disclosure section below.")
+   (table ["#" "Fact" "Op" "Booking" "Actor" "Basis" "Summary / rules"]
+          (map-indexed
+           (fn [i {:keys [t op booking-id actor basis summary violations phase-reason]}]
+             (row (esc (inc i))
+                  (case t
+                    :committed (tag "ok" "committed")
+                    :governor-hold (if (seq violations)
+                                     (tag "critical" "governor-hold")
+                                     (tag "warn" "phase-hold"))
+                    :approval-rejected (tag "critical" "approval-rejected")
+                    (tag "muted" (esc t)))
+                  (str "<code>" (esc op) "</code>")
+                  (str "<code>" (esc booking-id) "</code>")
+                  (esc actor)
+                  (if (seq basis)
+                    (str "<code>" (esc (str/join ", " basis)) "</code>")
+                    (tag "muted" "—"))
+                  (esc (or summary
+                           (some->> violations (map (comp name :rule)) seq (str/join ", "))
+                           (some-> phase-reason name)
+                           ""))))
+           ledger))))
+
+(defn- approver-on-record
+  "The human approver as RETAINED ON THE STORE RECORD -- read from the
+  record, never assumed to be there and never assumed to be absent."
+  [record]
+  (or (get-in record [:payload :approved-by])
+      (get-in record [:value :approved-by])))
+
+(defn- committed-steps
+  "The scenario steps that actually reached `:commit`, in run order.
+  `travelagency.operation`'s `:commit` node appends exactly one
+  coordination record per committing run, so this zips positionally with
+  `store/coordination-log`. The caller checks that the counts agree
+  before trusting the join rather than assuming they do."
+  [steps]
+  (filterv #(= :commit (:disposition %)) steps))
+
+(defn- coordination-section
+  "The committed coordination records, with the approver column DERIVED
+  by inspecting each stored record -- see `disclosure-section`."
+  [db steps]
+  (let [log (vec (store/coordination-log db))
+        committed (committed-steps steps)
+        aligned? (= (count log) (count committed))]
+    (section
+     (str "Committed coordination records — " (count log))
+     (str "Read back from <code>travelagency.store/coordination-log</code>. This is the only SSoT "
+          "mutation this actor performs; every row here passed the governor, then the phase gate, then "
+          "&mdash; where the ladder demanded it &mdash; a named human. The approver column is not "
+          "assumed: it is read out of each stored record at render time (see the disclosure below). "
+          (if aligned?
+            (str "The " (count log) " stored records align 1:1 in commit order with the "
+                 (count committed) " runs that reached <code>:commit</code>, so the &ldquo;via&rdquo; "
+                 "column below is a checked positional join, not a guess.")
+            (str "<b>The join could not be checked:</b> " (count log) " stored records vs. "
+                 (count committed) " runs that reached <code>:commit</code>. The &ldquo;via&rdquo; "
+                 "column is omitted rather than guessed.")))
+     (table (into ["#" "Op" "Booking" "Approver retained on the record"]
+                  (if aligned? ["Via" "Record payload"] ["Record payload"]))
+            (map-indexed
+             (fn [i r]
+               (let [who (approver-on-record r)
+                     step (when aligned? (nth committed i))]
+                 (apply row
+                        (esc (inc i))
+                        (str "<code>" (esc (:op r)) "</code>")
+                        (str "<code>" (esc (:booking-id r)) "</code>")
+                        (if who
+                          (tag "ok" (esc who))
+                          (tag "muted" "— (no human in this path)"))
+                        (concat
+                         (when aligned?
+                           [(str "<code>" (esc (:thread step)) "</code> · phase "
+                                 (esc (:phase step)) " · "
+                                 (if (:resumed? step)
+                                   (tag "warn" "human approval")
+                                   (tag "ok" "auto-commit")))])
+                         [(str "<code>" (esc (kv-str (:payload r))) "</code>")]))))
+             log)))))
+
+(defn- disclosure-section
+  "MEASURED, not assumed. Some sibling actors in this fleet lose the
+  approver because their `store/commit-record!` destructures `:value`
+  and drops `:payload`. Whether THIS repo does that is a question about
+  this repo's code, and the answer is derived here by walking the
+  records this run actually stored -- so this section stays true if the
+  behaviour ever changes, instead of becoming a lie the moment someone
+  fixes or breaks it."
+  [db steps]
+  (let [log (vec (store/coordination-log db))
+        committed (committed-steps steps)
+        aligned? (= (count log) (count committed))
+        ;; Which records SHOULD carry an approver: the ones whose run
+        ;; was actually resumed by a human. Taken from the run, not from
+        ;; the record we are auditing.
+        expected (when aligned?
+                   (set (keep-indexed (fn [i s] (when (:resumed? s) i)) committed)))
+        present (set (keep-indexed (fn [i r] (when (approver-on-record r) i)) log))
+        ;; The audit channel is the independent witness: :approval-granted
+        ;; facts carry :by, and they are written by the graph, not by the
+        ;; store.
+        granted (for [s steps, f (:audit s)
+                      :when (= :approval-granted (:t f))]
+                  {:thread (:thread s) :op (:op f) :booking-id (:booking-id f) :by (:by f)})
+        requested (for [s steps, f (:audit s)
+                        :when (= :approval-requested (:t f))]
+                    {:thread (:thread s) :op (:op f) :booking-id (:booking-id f)
+                     :reason (:reason f) :phase (:phase f)})
+        dropped (when aligned? (sort (remove present expected)))
+        spurious (when aligned? (sort (remove (or expected #{}) present)))
+        verdict (cond
+                  (not aligned?)
+                  [:warn (str "Could not be measured this run: the coordination log and the set of "
+                              "committing runs did not align, so no claim is made either way.")]
+
+                  (and (empty? dropped) (empty? spurious) (seq expected))
+                  [:ok (str "MEASURED: this repo RETAINS the approver. All "
+                            (count expected) " record(s) whose run was resumed by a human carry "
+                            "<code>:payload :approved-by</code>, and no record carries an approver "
+                            "without a matching approval. <code>travelagency.store/commit-record!</code> "
+                            "conj&rsquo;s the whole record, so <code>:payload</code> survives; "
+                            "<code>travelagency.operation</code>&rsquo;s <code>:request-approval</code> "
+                            "node is what writes <code>:approved-by</code> into it.")]
+
+                  (seq dropped)
+                  [:critical (str "MEASURED: the approver is BEING DROPPED. " (count dropped)
+                                  " record(s) came from a run a human resumed, but carry no approver: "
+                                  "index " (str/join ", " (map inc dropped))
+                                  ". The names below are joined from the run&rsquo;s audit facts and are "
+                                  "<b>audit only — not retained in the store record</b>.")]
+
+                  (seq spurious)
+                  [:critical (str "MEASURED: " (count spurious) " record(s) carry an approver although "
+                                  "no human resumed that run: index "
+                                  (str/join ", " (map inc spurious)) ".")]
+
+                  :else
+                  [:warn "MEASURED: no run in this scenario was resumed by a human, so approver retention was not exercised."])]
+    (section
+     "Approver attribution — measured, not assumed"
+     (str "Derived at render time by walking the records this run actually stored and comparing them "
+          "against which runs a human actually resumed. Nothing here is hardcoded about this repo: "
+          "if <code>commit-record!</code> or the approval node changes, this paragraph changes with it.")
+     (str "    <p class=\"" (name (first verdict)) "\">" (second verdict) "</p>\n"
+          (table ["Approval requested (audit channel)" "Op" "Booking" "Why escalated" "Granted by" "Retained in store?"]
+                 (for [rq requested
+                       :let [gr (first (filter #(= (:thread rq) (:thread %)) granted))
+                             idx (when (and aligned? gr)
+                                   (first (keep-indexed
+                                           (fn [i s] (when (= (:thread s) (:thread rq)) i))
+                                           committed)))
+                             retained (when idx (approver-on-record (nth log idx)))]]
+                   (row (str "<code>" (esc (:thread rq)) "</code>")
+                        (str "<code>" (esc (:op rq)) "</code>")
+                        (str "<code>" (esc (:booking-id rq)) "</code>")
+                        (str "<code>" (esc (:reason rq)) "</code> at phase " (esc (:phase rq)))
+                        (if gr
+                          (esc (:by gr))
+                          (tag "warn" "not granted — still pending"))
+                        (cond
+                          (nil? gr) (tag "muted" "n/a — never committed")
+                          retained (tag "ok" (esc retained))
+                          :else (tag "critical" "no — audit only, not retained in the store record")))))))))
+
+(defn- footer [db ledger steps]
+  (str "<footer>\n"
+       "  <p>Generated at build time by <code>travelagency.render-html</code> "
+       "(<code>clojure -M:dev:render-html</code>) by executing the real actor graph "
+       "<code>travelagency.operation/build</code> over <code>travelagency.store/seed-db</code>. "
+       (esc (count steps)) " actor runs · " (esc (count ledger)) " ledger facts · "
+       (esc (count (filter hard-hold? ledger))) " HARD governor holds · "
+       (esc (count (store/coordination-log db))) " committed records. "
+       "Deterministic: no clock, hostname or random source reaches this page, so consecutive "
+       "regenerations are byte-identical. The generator refuses to emit this file at all if the run "
+       "produces zero HARD governor holds.</p>\n"
+       "</footer>\n"))
+
+;; ----------------------------- document -----------------------------
+
+(defn render
+  "Renders the whole document from a completed `run-demo!` result. Every
+  run-derived section reads the post-run store; nothing is passed
+  through from the scenario's intent."
+  [{:keys [db steps]}]
+  (let [ledger (vec (store/ledger db))]
+    (str
+     "<!doctype html>\n"
+     "<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+     "<title>cloud-itonami-isic-7911 · travel agency activities — operator console</title>\n"
+     "<style>" (jp-go-dds.skin/dds+skin) "</style></head><body>\n"
+     "<header class=\"bar\">\n"
+     "  <h1>Travel agency activities (ISIC 7911) — Operator Console</h1>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · every figure recomputed from the store, never from a proposal</span>\n"
+     "</header>\n"
+     "<main>\n"
+     (section
+      "What this actor is allowed to do"
+      (str "This actor coordinates the <b>back office</b> of a travel agency &mdash; booking / itinerary "
+           "/ payment-status logging, confirmation scheduling, airline-hotel-vendor settlement "
+           "coordination, payment-dispute and fraud concern flagging &mdash; and, above those, the one "
+           "op that faces a traveler: quoting an itinerary and a fare. It <b>never</b> finalizes a "
+           "payment-dispute resolution or a refund / cancellation-policy override; those are a "
+           "permanent structural exclusion, not an unimplemented milestone. The advisor is smart but "
+           "untrusted: it only ever emits a proposal, and an independent governor recomputes the "
+           "claim from the store before anything is written.")
+      (table ["Constant" "Value" "Read from"]
+             [(row "Confidence floor" (str "<code>" (esc governor/confidence-floor) "</code>")
+                   "<code>governor/confidence-floor</code>")
+              (row "High-value settlement threshold (USD)"
+                   (str "<code>" (esc governor/high-value-threshold) "</code>")
+                   "<code>governor/high-value-threshold</code>")
+              (row "Closed op allowlist"
+                   (str "<code>" (esc (str/join ", " (sort-by name governor/allowed-ops))) "</code>")
+                   "<code>governor/allowed-ops</code>")
+              (row "Always-escalate ops"
+                   (str "<code>" (esc (str/join ", " (sort-by name governor/always-escalate-ops))) "</code>")
+                   "<code>governor/always-escalate-ops</code>")
+              (row "Permanently excluded phrases scanned"
+                   (str "<code>" (esc (count governor/scope-excluded-terms)) "</code>")
+                   "<code>governor/scope-excluded-terms</code>")]))
+     (bookings-section db)
+     (market-section db "bkg-1")
+     (phase-ladder-section)
+     (steps-section steps)
+     (holds-section ledger)
+     (ledger-section ledger)
+     (coordination-section db steps)
+     (disclosure-section db steps)
+     "</main>\n"
+     (footer db ledger steps)
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db steps] :as result} (run-demo!)
+        ledger (vec (store/ledger db))
+        hard (filterv hard-hold? ledger)]
+    ;; Build-time invariant, not a convention. A console for a governed
+    ;; actor that shows only happy paths advertises a governor nobody
+    ;; ever watched refuse anything -- so refuse to emit the file.
+    (when (zero? (count hard))
+      (throw (ex-info
+              (str "refusing to write " out
+                   ": the scenario produced 0 HARD governor holds. An operator console for a governed"
+                   " actor must demonstrate at least one un-overridable refusal.")
+              {:out out
+               :ledger-facts (count ledger)
+               :hard-holds 0
+               :phase-holds (count (filter phase-hold? ledger))
+               :committed (count (store/coordination-log db))})))
+    (io/make-parents out)
+    (spit out (render result))
+    (println "wrote" out
+             (str "(" (count steps) " actor runs, "
+                  (count ledger) " ledger facts, "
+                  (count hard) " HARD governor holds ["
+                  (str/join " " (sort (distinct (map (comp name :rule)
+                                                     (mapcat :violations hard)))))
+                  "], "
+                  (count (store/coordination-log db)) " committed records)"))))
