@@ -8,7 +8,7 @@
   `travelagency.phase` -> `travelagency.store`, wired together as the
   langgraph StateGraph that `travelagency.operation/build` compiles, and
   executed with `langgraph.graph/run*` exactly as
-  `travelagency.sim` (`clojure -M:dev:run`) does. Nothing on the page is
+  `travelagency.sim` (`kbb -M:dev:run`) does. Nothing on the page is
   hand-typed telemetry: every booking row is read back out of
   `store/all-bookings`, every settlement figure is a live
   `governor/recomputed-settlement` call, every market row is a live
@@ -22,7 +22,7 @@
   advisor is the deterministic mock, and no clock, hostname, random
   source or run counter reaches the page. Two consecutive runs are
   byte-identical -- verify with
-  `clojure -M:dev:render-html $(mktemp -d)/a.html` twice and `cmp`.
+  `kbb -M:dev:render-html $(mktemp -d)/a.html` twice and `cmp`.
   Any map printed into a cell goes through `kv-str`, which sorts by key
   name, so a map that grows past Clojure's array-map threshold and turns
   into a hash-map cannot silently reorder a column.
@@ -33,7 +33,7 @@
   watched refuse anything. The check is on the store ledger written by
   the real run, so it cannot be satisfied by editing this file's prose.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
+  Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [clojure.java.io :as io]
             [kotoba.lang.text :as str]
@@ -580,7 +580,7 @@
 (defn- footer [db ledger steps]
   (str "<footer>\n"
        "  <p>Generated at build time by <code>travelagency.render-html</code> "
-       "(<code>clojure -M:dev:render-html</code>) by executing the real actor graph "
+       "(<code>kbb -M:dev:render-html</code>) by executing the real actor graph "
        "<code>travelagency.operation/build</code> over <code>travelagency.store/seed-db</code>. "
        (esc (count steps)) " actor runs · " (esc (count ledger)) " ledger facts · "
        (esc (count (filter hard-hold? ledger))) " HARD governor holds · "
