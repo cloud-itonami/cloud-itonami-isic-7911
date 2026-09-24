@@ -3,7 +3,7 @@
   proposals -- the fast, focused complement to `governor-contract-test`'s
   full-graph integration coverage."
   (:require [kotoba.reservation :as res]
-            [clojure.test :refer [deftest is testing]]
+            [kotoba.test :refer [deftest is testing]]
             [travelagency.governor :as gov]
             [travelagency.advisor :as advisor]
             [travelagency.store :as store]))
