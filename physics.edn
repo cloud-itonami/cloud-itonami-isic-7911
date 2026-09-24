@@ -1,0 +1,44 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": robots do itinerary-preparation automation,
+;; booking-confirmation staging and document assembly for a travel agency
+;; (ISIC 7911). Their physical work: placing assembled travel-document
+;; wallets into the dispatch box, running laminated luggage tags / itinerary
+;; cards through a pouch laminator, and carrying clients' passports for visa
+;; processing down to the courier locker in the building lobby.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-7911"
+ :cases
+ [{:id :document-wallet-into-dispatch-box
+   :kind :manipulator
+   :procedure "desktop arm places an assembled travel-document wallet (vouchers, e-ticket printouts, maps) from the assembly table into the dispatch box"
+   :params {:l1-m 0.35 :l2-m 0.30 :m1-kg 2.2 :m2-kg 1.5
+            :from [0.45 0.20] :to [0.20 -0.15] :duration-s 1.5 :steps 300}
+   :sweep {:param :payload-kg :values [0.1 0.3 0.6 1.0 1.5]}
+   :quantity :peak-tau1-nm
+   :limit {:max 20.0 :basis "estimate: continuous shoulder torque of a small desktop arm (~2-3 kg payload class)"}
+   :boundary {:lo 0.05 :hi 10.0}}
+  {:id :luggage-tag-pouch-lamination
+   :kind :thermal
+   :procedure "robot feeds a luggage tag / itinerary card pouch through the 130 C laminator rollers; the adhesive at the pouch mid-plane must reach 100 C in the roller nip"
+   :params {:conductivity-w-mk 0.2 :density-kg-m3 1380.0 :specific-heat-j-kgk 1200.0
+            :t0-c 20.0 :t-hot-c 130.0 :h-front-w-m2k 400.0 :h-back-w-m2k 0.0 :t-back-ambient-c 20.0
+            :threshold-c 100.0 :duration-s 10.0 :nodes 7}
+   :sweep {:param :thickness-m :values [5.0e-5 1.0e-4 1.5e-4 2.0e-4 2.5e-4]}
+   :quantity :time-to-threshold-s
+   :limit {:max 1.0 :basis "estimate: roller-nip dwell of a desktop pouch laminator at ~300 mm/min feed; pouch modeled as half its total thickness (PET film, symmetric heating)"}
+   :boundary {:lo 2.0e-5 :hi 4.0e-4}}
+  {:id :passports-to-lobby-courier-locker
+   :kind :transport
+   :procedure "courier robot carries a sealed pouch of clients' passports from the agency floor to the courier locker in the building lobby"
+   :params {:mass-kg 30.0 :payload-kg 2.0 :v-max-mps 1.2 :a-max-mps2 0.6
+            :brake-decel-mps2 1.0 :drive-force-n 80.0 :crr 0.02
+            :cog-height-m 0.45 :support-half-length-m 0.22 :max-time-s 1800.0}
+   :sweep {:param :distance-m :values [15.0 40.0 80.0 150.0 250.0]}
+   :quantity :cycle-time-s
+   :limit {:max 150.0 :basis "estimate: the passport pouch must be in the locker within the courier's 2.5-minute pickup slot"}
+   :boundary {:lo 10.0 :hi 400.0}}]}
