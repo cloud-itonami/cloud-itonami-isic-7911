@@ -1,6 +1,6 @@
 (ns travelagency.advisor-test
   "Unit tests of `travelagency.advisor` proposal generation."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [travelagency.advisor :as adv]
             [travelagency.store :as store]))
 

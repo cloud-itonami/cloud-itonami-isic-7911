@@ -9,7 +9,7 @@
   the filed fares add to, and was that really the cheapest\". Each of
   those is a different way for an advisor to be wrong, so each gets its
   own rule."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [kotoba.fare :as fare]
             [kotoba.itinerary :as itin]
             [travelagency.advisor :as advisor]
